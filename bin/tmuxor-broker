@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# The human review gate. Watches the queue for messages parked by the Stop hook,
+# shows you each one with the recipient the sender chose, and relays it only if
+# you say so. You can retarget: the model picks the wrong teammate sometimes.
+set -uo pipefail
+
+TMUXOR_HOME=${TMUXOR_HOME:?tmuxor-broker must be launched by tmuxor}
+
+bold=$'\e[1m'; dim=$'\e[2m'; red=$'\e[31m'; grn=$'\e[32m'; ylw=$'\e[33m'; cyn=$'\e[36m'; off=$'\e[0m'
+
+declare -A PANE BUSY
+ROLES=()
+while IFS=$'\t' read -r role pane _; do
+  [ -n "$role" ] || continue
+  PANE[$role]=$pane; ROLES+=("$role")
+done <"$TMUXOR_HOME/panes.tsv"
+
+# Reserved targets that are not teammates: they park the chain here instead of
+# being relayed anywhere.
+is_terminal() { case $1 in done|human|operator|none) return 0 ;; *) return 1 ;; esac; }
+known() { [ -n "${PANE[$1]:-}" ]; }
+
+log() { printf '%s\n' "$*" >>"$TMUXOR_HOME/relay.log"; }
+
+deliver() { # $1=to $2=file $3=from
+  local wrapped; wrapped=$(mktemp "${TMPDIR:-/tmp}/tmuxor-send.XXXXXX")
+  # The recipient's system prompt says peer messages look like this. Without the
+  # tag it cannot tell a teammate apart from you typing into its pane.
+  { printf '[FROM %s]\n\n' "$(tr '[:lower:]' '[:upper:]' <<<"$3")"; cat "$2"; } >"$wrapped"
+  tmux load-buffer -b tmuxor "$wrapped"
+  # Bracketed paste keeps multi-line intact; send-keys would submit at line one.
+  tmux paste-buffer -p -b tmuxor -t "${PANE[$1]}"
+  sleep 0.4
+  tmux send-keys -t "${PANE[$1]}" Enter
+  rm -f "$wrapped"
+  BUSY[$1]=1
+}
+
+pick_target() {
+  local i=1 choice
+  echo >/dev/tty
+  for r in "${ROLES[@]}"; do
+    printf '  %d) %s%s\n' "$i" "$r" "${BUSY[$r]:+ (busy)}" >/dev/tty
+    i=$((i+1))
+  done
+  printf '  d) drop instead\n' >/dev/tty
+  printf 'deliver to > ' >/dev/tty
+  read -r choice </dev/tty
+  case $choice in
+    ''|d|D) echo "" ;;
+    *[!0-9]*) known "$choice" && echo "$choice" || echo "" ;;
+    *) echo "${ROLES[$((choice-1))]:-}" ;;
+  esac
+}
+
+printf '%s\n' "${bold}tmuxor broker${off} ${dim}— nothing is relayed without your approval${off}"
+printf '%s\n' "${dim}team: ${ROLES[*]}${off}"
+printf '%s\n' "${dim}queue: $TMUXOR_HOME/queue${off}"
+echo
+
+while true; do
+  msg=$(find "$TMUXOR_HOME/queue" -maxdepth 1 -name '*.json' 2>/dev/null | sort | head -1)
+  if [ -z "$msg" ]; then sleep 0.5; continue; fi
+
+  from=$(jq -r '.from' "$msg"); to=$(jq -r '.to' "$msg")
+  unset "BUSY[$from]"          # it just finished a turn, so it is idle again
+  body=$(mktemp "${TMPDIR:-/tmp}/tmuxor-msg.XXXXXX")
+  jq -r '.text' "$msg" >"$body"
+
+  while true; do
+    if   [ -z "$to" ];           then label="${red}UNROUTED${off}"
+    elif is_terminal "$to";      then label="${ylw}${to}${off} ${dim}(ends here)${off}"
+    elif ! known "$to";          then label="${red}${to}? unknown${off}"
+    else                              label="${bold}${to}${off}${BUSY[$to]:+ ${ylw}(busy)${off}}"
+    fi
+
+    echo "${cyn}────────────────────────────────────────────────────────${off}"
+    printf '%s\n' "${bold}${from}${off} ${dim}→${off} ${label}  ${dim}($(wc -l <"$body") lines)${off}"
+    echo "${cyn}────────────────────────────────────────────────────────${off}"
+    cat "$body"
+    echo "${cyn}────────────────────────────────────────────────────────${off}"
+
+    if [ -n "$to" ] && known "$to" && [ -n "${BUSY[$to]:-}" ]; then
+      printf '%s\n' "${ylw}warning: $to is mid-turn. Delivering now interleaves this with what it is already doing.${off}"
+    fi
+
+    printf '%s' "${grn}[s]${off}end  ${ylw}[r]${off}etarget  ${ylw}[e]${off}dit  ${ylw}[d]${off}rop  ${dim}[q]uit${off} > "
+    read -r -n1 key </dev/tty; echo
+
+    case $key in
+      s|S)
+        if is_terminal "$to"; then
+          log "$(date -Is) $from -> $to (parked)"
+          echo "${ylw}chain ends here — nothing relayed${off}"; echo; break
+        fi
+        if [ -z "$to" ] || ! known "$to"; then
+          echo "${red}no valid recipient — pick one${off}"; to=$(pick_target); continue
+        fi
+        deliver "$to" "$body" "$from"
+        log "$(date -Is) $from -> $to $(wc -c <"$body") bytes"
+        echo "${grn}sent to $to${off}"; echo; break ;;
+      r|R) to=$(pick_target); continue ;;
+      e|E) "${EDITOR:-nano}" "$body" </dev/tty >/dev/tty 2>&1; continue ;;
+      d|D) log "$(date -Is) $from -> ${to:-?} DROPPED"; echo "${ylw}dropped${off}"; echo; break ;;
+      q|Q) rm -f "$body"; echo "bye"; exit 0 ;;
+      *) continue ;;
+    esac
+  done
+
+  rm -f "$msg" "$body"
+done

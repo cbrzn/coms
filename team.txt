@@ -1,0 +1,5 @@
+# one agent per line: <command> <role> [--entry]
+# role must have a prompt at roles/<role>.md
+claude specifier
+claude builder
+claude tester
