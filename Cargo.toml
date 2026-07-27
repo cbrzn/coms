@@ -1,0 +1,11 @@
+[package]
+name = "tmuxor"
+version = "0.1.0"
+edition = "2024"
+description = "Human-gated routing for terminal coding agents in tmux"
+
+[[bin]]
+name = "tmuxor"
+path = "src/main.rs"
+
+[dependencies]

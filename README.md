@@ -1,8 +1,8 @@
 # tmuxor
 
-A team of Claude Code agents that talk to each other, each in its own tmux
-session and its own git worktree, with **you as the gate between them**. Agents
-decide who to talk to; nothing is relayed until you approve it.
+A human-gated router for terminal coding agents. Each agent runs in its own tmux
+session and git worktree, with **you as the gate between them**. Agents decide
+who to talk to; nothing is relayed until you approve it.
 
 ```
 tmuxor-specifier ─┐
@@ -13,11 +13,21 @@ tmuxor-tester    ─┘        (you)
 ## Use
 
 ```sh
-bin/tmuxor /path/to/repo --task "Add retry logic to the HTTP client."
-tmux attach -t tmuxor-broker
+cargo install --path .
+tmuxor /path/to/repo --task "Add retry logic to the HTTP client."
 ```
 
-Define the team in `team.txt` — one agent per line:
+On a graphical Linux desktop, tmuxor opens a terminal for the broker and each
+agent session automatically. Use `--no-view` for a headless run, then attach
+manually with `tmux attach -t tmuxor-broker`.
+
+Stop a running team without deleting its worktrees or runtime files:
+
+```sh
+tmuxor stop /path/to/repo
+```
+
+Define the team in `agora/team.txt` — one agent per line:
 
 ```
 claude specifier
@@ -25,22 +35,45 @@ claude builder
 claude tester
 ```
 
-The first agent is the entry point unless another is marked `--entry`. Each
-needs a prompt at `roles/<name>.md` — plain prose, no boilerplate. The launcher
-appends a generated roster so every agent knows who its teammates are, what they
-do, and where their worktrees are.
+Use this project layout:
 
-A repo may carry its own `team.txt` and `roles/`; they take precedence over the
-ones here. Override explicitly with `--team` / `--roles`.
+```
+your-repo/
+└── agora/
+    ├── team.txt
+    ├── rules/
+    │   ├── 00-project.md
+    │   └── 10-testing.md
+    └── roles/
+        ├── specifier.md
+        ├── builder.md
+        └── tester.md
+```
+
+The first agent is the entry point unless another is marked `--entry`. The first
+field is the agent adapter and the second is its role. Every agent receives the
+Markdown files in `agora/rules/`, in filename order, followed by its unique
+role prompt from `agora/roles/<name>.md` and the generated roster/routing
+instructions.
+
+`agora/` takes precedence over root-level `manifest`, `team.txt`, `roles/`, and
+`rules/`. Override any location explicitly with `--team`, `--roles`, or
+`--rules`.
 
 | flag | meaning |
 | --- | --- |
 | `--task "..."` | opening instruction, pasted into the entry agent |
-| `--team FILE` | team manifest (default: repo's, else this one) |
-| `--roles DIR` | role prompt directory |
+| `--team FILE` | team manifest (default: `agora/team.txt`) |
+| `--roles DIR` | role prompt directory (default: `agora/roles/`) |
+| `--rules DIR` | shared Markdown rules directory (default: `agora/rules/`) |
 | `--perm <mode>` | permission mode (default `auto`) |
 | `--yolo` | `bypassPermissions` — never prompts |
 | `--clean` | tear down sessions, worktrees and branches first |
+| `--no-view` | do not open terminal windows automatically |
+
+If an agent or broker process exits unexpectedly, its tmux pane remains open
+with the exit status so you can inspect its output. Use `tmuxor stop <repo>`
+when you want to close the sessions deliberately.
 
 ## Routing
 
@@ -58,15 +91,28 @@ In the broker: `s` send, `r` retarget, `e` edit in `$EDITOR`, `d` drop, `q` quit
 
 ## How it works
 
-1. An agent finishes its turn; its `Stop` hook fires.
-2. `hooks/relay-stop.sh` parses the routing line and writes `{from, to, text}`
+1. An agent finishes its turn; its completion hook fires.
+2. `tmuxor relay-stop` parses the routing line and writes `{from, to, text}`
    into `.tmuxor/queue/`, then exits 0 — non-blocking, so the agent goes idle.
 3. The broker shows you the message and who it is addressed to, and waits.
 4. On approval it tags the message `[FROM SPECIFIER]`, pastes it into the
    recipient's pane, and submits.
 
-The Stop payload includes `last_assistant_message` directly, so nothing parses
-the transcript JSONL.
+For the Claude adapter, the Stop payload includes `last_assistant_message`
+directly, so nothing parses the transcript JSONL.
+
+## Agent adapters
+
+The Rust binary separates the shared runtime (worktrees, tmux panes, queue,
+broker and delivery) from agent-specific setup. `claude` is the currently
+implemented adapter: it generates Claude settings, injects its Stop hook, and
+starts Claude with the role prompt.
+
+This makes other agents a contained addition rather than a rewrite of the
+broker. An adapter needs to define how to start the agent, supply the generated
+role prompt, and surface a completed assistant message to `tmuxor relay-stop`
+(or an equivalent event source). Codex and OpenCode can use the same routing and
+broker once their adapter hooks or completion-monitoring mechanism are defined.
 
 ## Things that were not obvious
 
@@ -93,12 +139,14 @@ work and stops the risky calls.
 files and gives you a git-level undo. It does not sandbox what a shell command
 can reach. `--yolo` removes the last check.
 
-**Subagent turns fire `Stop` too.** The hook ignores any payload carrying an
-`agent_id`; a subagent's report is internal, not a message to a teammate.
+**Subagent turns fire `Stop` too.** The Claude adapter ignores any payload
+carrying an `agent_id`; a subagent's report is internal, not a message to a
+teammate.
 
 **Identity travels as env, not config.** All worktrees share the repo, so a
-committed `.claude/settings.json` would apply to every agent. Each role gets a
-generated settings file plus `TMUXOR_ROLE`/`TMUXOR_HOME` in its environment.
+committed agent settings file would apply to every agent. Each role gets a
+generated adapter settings file plus `TMUXOR_ROLE`/`TMUXOR_HOME` in its
+environment.
 
 **tmux runs pane commands through `sh`.** On Ubuntu that is dash, which does not
 understand the `$'...'` quoting bash emits for multi-line strings. Each role gets
@@ -115,11 +163,10 @@ a generated launcher script so the pane command is a bare path.
 ## Layout
 
 ```
-bin/tmuxor            launcher — team file, worktrees, sessions, prompts
-bin/tmuxor-broker     the review gate
-hooks/relay-stop.sh   Stop hook — parses routing, queues, never sends
-team.txt              example manifest
-roles/*.md            example role prompts
+src/main.rs            launcher, broker and completion-hook subcommands
+Cargo.toml             dependency-free Rust package
+examples/team.txt     bundled example manifest
+examples/roles/*.md   bundled example role prompts
 ```
 
 Runtime state lives in `<repo>/.tmuxor/` (queue, generated prompts and settings,
