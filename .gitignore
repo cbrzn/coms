@@ -1,3 +1,4 @@
 .duo/
 .tmuxor/
 target/
+.claude*

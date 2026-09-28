@@ -1,5 +1,6 @@
-# one agent per line: <command> <role> [--entry]
-# role must have a prompt at roles/<role>.md
+# one agent per line: <adapter> <role> [--entry]
+# adapters: claude, codex
+# each role needs a prompt at roles/<role>.md beside this file
 claude specifier
 claude builder
 claude tester

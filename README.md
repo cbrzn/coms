@@ -98,21 +98,32 @@ In the broker: `s` send, `r` retarget, `e` edit in `$EDITOR`, `d` drop, `q` quit
 4. On approval it tags the message `[FROM SPECIFIER]`, pastes it into the
    recipient's pane, and submits.
 
-For the Claude adapter, the Stop payload includes `last_assistant_message`
-directly, so nothing parses the transcript JSONL.
+Both adapters hand `relay-stop` a finished assistant message directly, so
+nothing parses a transcript.
 
 ## Agent adapters
 
 The Rust binary separates the shared runtime (worktrees, tmux panes, queue,
-broker and delivery) from agent-specific setup. `claude` is the currently
-implemented adapter: it generates Claude settings, injects its Stop hook, and
-starts Claude with the role prompt.
+broker and delivery) from agent-specific setup. Everything an adapter varies
+sits behind `Adapter::generate_files`; the broker, queue, routing and prompt
+text never learn which CLI is on the other end.
 
-This makes other agents a contained addition rather than a rewrite of the
-broker. An adapter needs to define how to start the agent, supply the generated
-role prompt, and surface a completed assistant message to `tmuxor relay-stop`
-(or an equivalent event source). Codex and OpenCode can use the same routing and
-broker once their adapter hooks or completion-monitoring mechanism are defined.
+| | `claude` | `codex` |
+|---|---|---|
+| end-of-turn callback | `Stop` hook in a generated settings file | `notify` program in a generated profile |
+| payload arrives as | JSON on stdin | JSON as `argv[1]`, piped to stdin by a generated shim |
+| message field | `last_assistant_message` | `last-assistant-message` |
+| per-agent config | `--settings FILE` | `--profile tmuxor-<role>`, layered over your own config |
+| role prompt | `--append-system-prompt-file` | `developer_instructions` |
+| permissions | `--permission-mode` | `--ask-for-approval` + `--sandbox` |
+
+`--perm` keeps Claude's vocabulary and maps onto codex: `auto`/`default` ->
+`on-request` + `workspace-write`, `acceptEdits` -> `never` + `workspace-write`,
+`plan` -> `untrusted` + `read-only`, `--yolo` ->
+`--dangerously-bypass-approvals-and-sandbox`.
+
+A third adapter needs the same three things: how to start the agent, where the
+role prompt goes, and how a finished message reaches `tmuxor relay-stop`.
 
 ## Things that were not obvious
 
@@ -141,7 +152,35 @@ can reach. `--yolo` removes the last check.
 
 **Subagent turns fire `Stop` too.** The Claude adapter ignores any payload
 carrying an `agent_id`; a subagent's report is internal, not a message to a
-teammate.
+teammate. Codex `notify` fires for more than turn completion, so `relay-stop`
+also drops any payload whose `type` is not `agent-turn-complete`.
+
+**Codex profiles layer, so agents keep your real config.** A generated
+`$CODEX_HOME/tmuxor-<role>.config.toml` adds only `notify`,
+`developer_instructions` and trust entries; model, MCP servers and everything
+else still come from your own `config.toml`. `--clean` deletes them.
+
+**An untrusted directory blocks the first turn.** Codex prompts for trust in a
+fresh worktree, and `--task` would paste into that prompt instead of the
+composer, so the generated profile pre-trusts the repo and the agent's worktree.
+That trust is scoped to the tmuxor profile, not written to your own config.
+
+**Codex fires `notify` for its own internal turns.** Generating a thread title
+is a real `agent-turn-complete` in its own thread, and its assistant message
+(`{"title":"..."}`) was reaching the broker as an UNROUTED message; recap and
+memory-consolidation turns would do the same. Blocklisting known internals would
+rot as codex adds more, so the codex shim passes
+`relay-stop --require-relayed-input` and only turns whose input *begins with*
+tmuxor's `[FROM ...]` header are relayed. It must be `starts_with`, not
+`contains`: the title prompt embeds the user's message verbatim under a
+`User prompt:` heading, so a substring test passes on exactly the turn it is
+meant to reject. The cost is that a message you type directly into a codex pane
+is not auto-relayed — talk to a codex agent by hand and its reply stays in the
+pane.
+
+**Codex does not need `--add-dir` to read teammates.** There it grants *write*
+access, which would break the one-writer-per-worktree rule; its sandbox already
+allows reads outside the workspace.
 
 **Identity travels as env, not config.** All worktrees share the repo, so a
 committed agent settings file would apply to every agent. Each role gets a
@@ -169,5 +208,7 @@ examples/team.txt     bundled example manifest
 examples/roles/*.md   bundled example role prompts
 ```
 
-Runtime state lives in `<repo>/.tmuxor/` (queue, generated prompts and settings,
-`panes.tsv`, `relay.log`). Worktrees go in `<repo>/.claude-worktrees/`.
+Runtime state lives in `<repo>/.tmuxor/` (queue, generated prompts, settings,
+launchers and notify shims, `panes.tsv`, `relay.log`). Worktrees go in
+`<repo>/.claude-worktrees/`. The codex adapter also writes
+`$CODEX_HOME/tmuxor-<role>.config.toml` (default `~/.codex`).

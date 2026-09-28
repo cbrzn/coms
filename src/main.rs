@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const DEFAULT_TEAM: &str = include_str!("../examples/team.txt");
+const RELAY_MARKER: &str = "[FROM ";
 
 #[derive(Debug, Clone)]
 struct Agent {
@@ -28,16 +29,32 @@ struct Rule {
 #[derive(Debug, Clone, Copy)]
 enum Adapter {
     Claude,
+    Codex,
 }
 
 impl Adapter {
     fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
             _ => Err(format!(
-                "agent adapter '{value}' is not implemented yet; available adapters: claude"
+                "agent adapter '{value}' is not implemented yet; available adapters: claude, codex"
             )
             .into()),
+        }
+    }
+
+    fn generate_files(
+        self,
+        runtime: &Runtime,
+        agent: &Agent,
+        agents: &[Agent],
+        rules: &[Rule],
+        permission_mode: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Claude => generate_claude_files(runtime, agent, agents, rules, permission_mode),
+            Self::Codex => generate_codex_files(runtime, agent, agents, rules, permission_mode),
         }
     }
 }
@@ -88,14 +105,25 @@ fn run() -> Result<()> {
         }
         Some("relay-stop") => {
             arguments.remove(0);
+            let require_relayed_input = match arguments.first().map(String::as_str) {
+                Some("--require-relayed-input") => {
+                    arguments.remove(0);
+                    true
+                }
+                _ => false,
+            };
             if !arguments.is_empty() {
-                return Err("usage: tmuxor relay-stop".into());
+                return Err("usage: tmuxor relay-stop [--require-relayed-input]".into());
             }
-            relay_stop()
+            relay_stop(require_relayed_input)
         }
         Some("stop") => {
             arguments.remove(0);
             stop(&arguments)
+        }
+        Some("init") => {
+            arguments.remove(0);
+            init(&arguments)
         }
         Some("-h") | Some("--help") | None => {
             print_usage();
@@ -109,6 +137,7 @@ fn print_usage() {
     println!(
         "Usage: tmuxor <repo> [--team FILE] [--roles DIR] [--rules DIR] [--task TEXT] [--perm MODE] [--yolo] [--clean] [--no-view]"
     );
+    println!("       tmuxor init [repo] [--force]");
     println!("       tmuxor broker");
     println!("       tmuxor relay-stop");
     println!("       tmuxor stop <repo>");
@@ -367,6 +396,11 @@ fn clean(runtime: &Runtime, agents: &[Agent]) -> Result<()> {
             &runtime.repo,
             ["branch", "-D", &format!("tmuxor/{}", agent.role)],
         );
+        if matches!(agent.adapter, Adapter::Codex)
+            && let Ok(profile) = codex_profile_path(&agent.role)
+        {
+            let _ = fs::remove_file(profile);
+        }
     }
     let _ = tmux(["kill-session", "-t", "tmuxor-broker"]);
     if runtime.home.exists() {
@@ -427,11 +461,9 @@ fn generate_agent_files(
     permission_mode: &str,
 ) -> Result<()> {
     for agent in agents {
-        match agent.adapter {
-            Adapter::Claude => {
-                generate_claude_files(runtime, agent, agents, rules, permission_mode)?
-            }
-        }
+        agent
+            .adapter
+            .generate_files(runtime, agent, agents, rules, permission_mode)?;
     }
     Ok(())
 }
@@ -491,6 +523,107 @@ fn generate_claude_files(
     launcher.push('\n');
     fs::write(&launcher_path, launcher)?;
     make_executable(&launcher_path)
+}
+
+fn generate_codex_files(
+    runtime: &Runtime,
+    agent: &Agent,
+    agents: &[Agent],
+    rules: &[Rule],
+    permission_mode: &str,
+) -> Result<()> {
+    let prompt = generated_prompt(agent, agents, rules, runtime);
+    let prompt_path = runtime.home.join(format!("prompt-{}.txt", agent.role));
+    fs::write(&prompt_path, &prompt)?;
+
+    let notify_path = runtime.home.join(format!("notify-{}.sh", agent.role));
+    let mut notify = String::from("#!/usr/bin/env sh\n");
+    notify.push_str(&format!(
+        "TMUXOR_HOME={}\n",
+        shell_quote(&runtime.home.display().to_string())
+    ));
+    notify.push_str(&format!("TMUXOR_ROLE={}\n", shell_quote(&agent.role)));
+    notify.push_str("export TMUXOR_HOME TMUXOR_ROLE\n");
+    notify.push_str(&format!(
+        "printf '%s' \"$1\" | {} relay-stop --require-relayed-input\n",
+        shell_quote(&runtime.executable.display().to_string())
+    ));
+    fs::write(&notify_path, notify)?;
+    make_executable(&notify_path)?;
+
+    let profile_path = codex_profile_path(&agent.role)?;
+    if let Some(parent) = profile_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let worktree = runtime.worktrees.join(format!("tmuxor-{}", agent.role));
+    let mut profile = format!(
+        "notify = [{}]\ndeveloper_instructions = {}\n",
+        json_string(&notify_path.display().to_string()),
+        json_string(&prompt)
+    );
+    for trusted in [&runtime.repo, &worktree] {
+        profile.push_str(&format!(
+            "\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            json_string(&trusted.display().to_string())
+        ));
+    }
+    fs::write(&profile_path, profile)?;
+
+    let mut arguments = vec!["--profile".to_owned(), codex_profile_name(&agent.role)];
+    arguments.extend(codex_permission_arguments(permission_mode)?);
+
+    let launcher_path = runtime.home.join(format!("launch-{}.sh", agent.role));
+    let mut launcher = String::from("#!/usr/bin/env sh\nexec codex");
+    for argument in &arguments {
+        launcher.push_str(&format!(" \\\n  {}", shell_quote(argument)));
+    }
+    launcher.push('\n');
+    fs::write(&launcher_path, launcher)?;
+    make_executable(&launcher_path)
+}
+
+fn codex_permission_arguments(permission_mode: &str) -> Result<Vec<String>> {
+    let arguments: &[&str] = match permission_mode {
+        "auto" | "default" => &[
+            "--ask-for-approval",
+            "on-request",
+            "--sandbox",
+            "workspace-write",
+        ],
+        "acceptEdits" => &[
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+        ],
+        "plan" => &["--ask-for-approval", "untrusted", "--sandbox", "read-only"],
+        "bypassPermissions" => &["--dangerously-bypass-approvals-and-sandbox"],
+        _ => {
+            return Err(format!(
+                "codex has no mapping for permission mode '{permission_mode}'; use auto, default, acceptEdits, plan or bypassPermissions"
+            )
+            .into());
+        }
+    };
+    Ok(arguments
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect())
+}
+
+fn codex_profile_name(role: &str) -> String {
+    format!("tmuxor-{role}")
+}
+
+fn codex_profile_path(role: &str) -> Result<PathBuf> {
+    let home = match env::var("CODEX_HOME") {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => PathBuf::from(
+            env::var("HOME").map_err(|_| "cannot locate the codex home: HOME is not set")?,
+        )
+        .join(".codex"),
+    };
+    Ok(home.join(format!("{}.config.toml", codex_profile_name(role))))
 }
 
 fn generated_prompt(agent: &Agent, agents: &[Agent], rules: &[Rule], runtime: &Runtime) -> String {
@@ -627,6 +760,97 @@ fn stop(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn init(arguments: &[String]) -> Result<()> {
+    let mut target = None;
+    let mut force = false;
+    for argument in arguments {
+        match argument.as_str() {
+            "--force" => force = true,
+            value if value.starts_with('-') => {
+                return Err(format!("unknown option for init: {value}").into());
+            }
+            value if target.is_none() => target = Some(PathBuf::from(value)),
+            value => return Err(format!("unexpected argument for init: {value}").into()),
+        }
+    }
+
+    let target = target.unwrap_or_else(|| PathBuf::from("."));
+    let repo = git_output(&target, ["rev-parse", "--show-toplevel"])?;
+    let repo = PathBuf::from(repo.trim());
+
+    let mut files = vec![("agora/team.txt".to_owned(), DEFAULT_TEAM.to_owned())];
+    for role in default_roles() {
+        let prompt = builtin_prompt(&role)
+            .ok_or_else(|| format!("no built-in prompt for {role}"))?
+            .to_owned();
+        files.push((format!("agora/roles/{role}.md"), prompt));
+    }
+    files.push(("agora/rules/.gitkeep".to_owned(), String::new()));
+
+    for (relative, contents) in &files {
+        if write_scaffold(&repo, relative, contents, force)? {
+            println!("created   {relative}");
+        } else {
+            println!("exists    {relative}");
+        }
+    }
+    for entry in add_gitignore_entries(&repo, &[".tmuxor/", ".claude-worktrees/"])? {
+        println!("gitignore {entry}");
+    }
+
+    println!("run: tmuxor {}", repo.display());
+    Ok(())
+}
+
+fn default_roles() -> Vec<String> {
+    DEFAULT_TEAM
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned))
+        .collect()
+}
+
+fn write_scaffold(repo: &Path, relative: &str, contents: &str, force: bool) -> Result<bool> {
+    let path = repo.join(relative);
+    if path.exists() && !force {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, contents)?;
+    Ok(true)
+}
+
+fn add_gitignore_entries(repo: &Path, entries: &[&str]) -> Result<Vec<String>> {
+    let path = repo.join(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let present = existing
+        .lines()
+        .map(|line| line.trim().trim_end_matches('/'))
+        .collect::<HashSet<_>>();
+    let missing = entries
+        .iter()
+        .filter(|entry| !present.contains(entry.trim_end_matches('/')))
+        .map(|entry| (*entry).to_owned())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(missing);
+    }
+
+    let mut contents = existing;
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    for entry in &missing {
+        contents.push_str(entry);
+        contents.push('\n');
+    }
+    fs::write(&path, contents)?;
+    Ok(missing)
+}
+
 fn open_terminal_views(agents: &[Agent]) {
     let mut sessions = vec!["tmuxor-broker".to_owned()];
     sessions.extend(agents.iter().map(|agent| format!("tmuxor-{}", agent.role)));
@@ -659,7 +883,7 @@ fn terminal_view_arguments(session: &str) -> Vec<String> {
 fn deliver_task(runtime: &Runtime, entry: &str, task: &str) -> Result<()> {
     thread::sleep(Duration::from_secs(4));
     let task_path = runtime.home.join("task.txt");
-    fs::write(&task_path, task)?;
+    fs::write(&task_path, format!("{RELAY_MARKER}OPERATOR]\n\n{task}"))?;
     let pane = read_panes(&runtime.home)?
         .remove(entry)
         .ok_or_else(|| format!("entry role '{entry}' has no pane"))?;
@@ -895,7 +1119,7 @@ fn deliver(pane: &str, body: &Path, from: &str) -> Result<()> {
     result
 }
 
-fn relay_stop() -> Result<()> {
+fn relay_stop(require_relayed_input: bool) -> Result<()> {
     let home = match env::var("TMUXOR_HOME") {
         Ok(value) => PathBuf::from(value),
         Err(_) => return Ok(()),
@@ -905,7 +1129,21 @@ fn relay_stop() -> Result<()> {
     if object_string_field(&payload, "agent_id")?.is_some_and(|agent_id| !agent_id.is_empty()) {
         return Ok(());
     }
-    let Some(message) = object_string_field(&payload, "last_assistant_message")? else {
+    if object_string_field(&payload, "type")?.is_some_and(|kind| kind != "agent-turn-complete") {
+        return Ok(());
+    }
+    if require_relayed_input
+        && !object_string_array_field(&payload, "input-messages")?
+            .iter()
+            .any(|input| input.trim_start().starts_with(RELAY_MARKER))
+    {
+        return Ok(());
+    }
+    let message = match object_string_field(&payload, "last_assistant_message")? {
+        Some(message) => Some(message),
+        None => object_string_field(&payload, "last-assistant-message")?,
+    };
+    let Some(message) = message else {
         return Ok(());
     };
     if message.is_empty() {
@@ -1053,6 +1291,54 @@ fn json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+fn object_string_array_field(input: &str, wanted_key: &str) -> Result<Vec<String>> {
+    let bytes = input.as_bytes();
+    let mut index = skip_whitespace(bytes, 0);
+    if bytes.get(index) != Some(&b'{') {
+        return Err("expected a JSON object".into());
+    }
+    index += 1;
+    loop {
+        index = skip_whitespace(bytes, index);
+        if bytes.get(index) == Some(&b'}') {
+            return Ok(Vec::new());
+        }
+        let (key, next) = parse_json_string(input, index)?;
+        index = skip_whitespace(bytes, next);
+        if bytes.get(index) != Some(&b':') {
+            return Err("expected ':' in JSON object".into());
+        }
+        index = skip_whitespace(bytes, index + 1);
+        if key == wanted_key {
+            if bytes.get(index) != Some(&b'[') {
+                return Ok(Vec::new());
+            }
+            index = skip_whitespace(bytes, index + 1);
+            let mut values = Vec::new();
+            if bytes.get(index) == Some(&b']') {
+                return Ok(values);
+            }
+            loop {
+                let (value, next) = parse_json_string(input, index)?;
+                values.push(value);
+                index = skip_whitespace(bytes, next);
+                match bytes.get(index) {
+                    Some(b',') => index = skip_whitespace(bytes, index + 1),
+                    Some(b']') => return Ok(values),
+                    _ => return Err("expected ',' or ']' in JSON array".into()),
+                }
+            }
+        }
+        index = skip_json_value(input, index)?;
+        index = skip_whitespace(bytes, index);
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => return Ok(Vec::new()),
+            _ => return Err("expected ',' or '}' in JSON object".into()),
+        }
+    }
 }
 
 fn object_string_field(input: &str, wanted_key: &str) -> Result<Option<String>> {
