@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>tmuxor · Team workspace</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23272d25'/%3E%3Cpath d='M10 12l8 8-8 8m12 0h9' stroke='%23d9ed9b' stroke-width='3' fill='none'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/vendor/xterm.css">
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/vendor/xterm.js"></script>
+  <script defer src="/vendor/addon-fit.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="tmuxor home"><span class="brand-mark">›_</span>tmuxor<span class="brand-dot">.</span></a>
+    <div class="project"><span class="folder-icon" aria-hidden="true">▱</span><span id="project-name">Team workspace</span><span class="local-tag">LOCAL</span></div>
+    <div class="connection"><span class="dot" id="connection-dot"></span><span id="connection-label">Connecting</span></div>
+  </header>
+
+  <div class="workspace">
+    <aside class="sidebar" aria-label="Agents">
+      <div class="section-label">YOUR TEAM <span id="agent-count">—</span></div>
+      <nav id="agents" aria-label="Choose an agent"></nav>
+      <div class="sidebar-bottom"><span class="small-symbol">↔</span><strong>One team. Your call.</strong><p>You review every handoff between agents.</p><span class="gate-badge"><span class="dot"></span> Human approval on</span></div>
+    </aside>
+
+    <main class="main">
+      <div class="workspace-heading"><div><div class="eyebrow">WORKSPACE</div><h1 id="workspace-title">Team workspace</h1><p id="workspace-subtitle">A shared view of your agents at work.</p></div><div class="view-switch" role="group" aria-label="Terminal layout"><button id="focus-view" aria-pressed="true">▣ <span>Focus</span></button><button id="split-view" aria-pressed="false">▥ <span>Split</span></button></div></div>
+      <div id="terminals" class="terminals"><div id="terminal-empty" class="terminal-empty">Connecting to your team…</div></div>
+      <form id="operator-form" class="composer">
+        <div class="composer-heading"><label for="operator-text">Message <span id="composer-role">an agent</span></label><span>⌘ / Ctrl + Enter to send</span></div>
+        <div class="composer-body"><textarea id="operator-text" placeholder="Give direction, ask a question, or start a task…" rows="2" required></textarea><button id="operator-send" type="submit" class="button button-dark">Send <span aria-hidden="true">↗</span></button></div>
+      </form>
+      <footer class="workspace-footer"><span><span class="dot"></span> Sessions stay running when you close this page</span><button id="inbox-toggle" class="text-button" aria-expanded="true">Toggle inbox</button></footer>
+    </main>
+
+    <aside class="broker" id="broker" aria-label="Message review">
+      <div class="broker-heading"><div class="eyebrow">THE BROKER</div><h2>Review &amp; relay <span class="inbox-count" id="inbox-count">0</span></h2><p>You decide what happens next.</p></div>
+      <div class="broker-tabs" role="tablist" aria-label="Broker views"><button id="inbox-tab" role="tab" aria-selected="true" aria-controls="inbox-panel">Inbox</button><button id="activity-tab" role="tab" aria-selected="false" aria-controls="activity-panel">Activity</button></div>
+      <div id="inbox-panel" role="tabpanel" aria-labelledby="inbox-tab" class="broker-panel">
+        <div id="inbox-list" class="inbox-list" aria-label="Pending messages"></div>
+        <div id="inbox-empty" class="empty-inbox"><div class="empty-inbox-icon">↗</div><h3>All caught up.</h3><p>Agent replies arrive here.<br>You choose where they go.</p><div class="empty-rule"></div><small>Nothing moves without your approval.</small></div>
+        <form id="review-form" hidden>
+          <div class="review-meta"><span id="review-from"></span><span id="review-time"></span></div>
+          <label class="field-label" for="review-text">MESSAGE <span>Editable before sending</span></label>
+          <textarea id="review-text" rows="10" spellcheck="false"></textarea>
+          <label class="field-label" for="review-to">SEND TO</label><select id="review-to"><option value="">Choose a recipient…</option></select>
+          <p class="review-warning" id="review-warning" hidden></p>
+          <label class="busy-confirm" id="busy-confirm-label" hidden><input type="checkbox" id="busy-confirm"> Send while this agent may be working</label>
+          <div class="review-actions"><button type="button" id="drop-message" class="button button-quiet">Drop</button><button type="submit" id="send-message" class="button button-accent">Approve &amp; send <span aria-hidden="true">↗</span></button></div>
+          <p class="review-note">Your edits are included in the handoff.</p>
+        </form>
+      </div>
+      <div id="activity-panel" role="tabpanel" aria-labelledby="activity-tab" class="broker-panel" hidden><div id="activity-list"></div></div>
+      <div class="broker-footer"><span class="dot"></span> Every handoff, with intention.</div>
+    </aside>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <div id="error-banner" class="error-banner" role="alert" hidden></div>
+</body>
+</html>

@@ -1,5 +1,5 @@
 # one agent per line: <adapter> <role> [--entry]
-# adapters: claude, codex
+# adapters: claude, codex, opencode (can be mixed)
 # each role needs a prompt at roles/<role>.md beside this file
 claude specifier
 claude builder

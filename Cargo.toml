@@ -2,6 +2,7 @@
 name = "tmuxor"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Human-gated routing for terminal coding agents in tmux"
 
 [[bin]]
@@ -9,3 +10,12 @@ name = "tmuxor"
 path = "src/main.rs"
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

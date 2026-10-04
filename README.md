@@ -14,12 +14,16 @@ tmuxor-tester    ─┘        (you)
 
 ```sh
 cargo install --path .
-tmuxor /path/to/repo --task "Add retry logic to the HTTP client."
+tmuxor /path/to/repo --ui --task "Add retry logic to the HTTP client."
 ```
 
-On a graphical Linux desktop, tmuxor opens a terminal for the broker and each
-agent session automatically. Use `--no-view` for a headless run, then attach
-manually with `tmux attach -t tmuxor-broker`.
+Requires Rust 1.89+ to build, Git, tmux, and the agent CLIs used by your team.
+`--ui` opens a local browser dashboard. The installed binary includes all web
+assets; Node and npm are only needed when developing the frontend.
+
+Without `--ui`, tmuxor uses the terminal broker and opens terminal windows on
+graphical Linux desktops. `--no-view` skips opening the browser or terminal
+windows. In terminal mode, attach with `tmux attach -t tmuxor-broker`.
 
 Stop a running team without deleting its worktrees or runtime files:
 
@@ -66,14 +70,99 @@ instructions.
 | `--team FILE` | team manifest (default: `agora/team.txt`) |
 | `--roles DIR` | role prompt directory (default: `agora/roles/`) |
 | `--rules DIR` | shared Markdown rules directory (default: `agora/rules/`) |
-| `--perm <mode>` | permission mode (default `auto`) |
-| `--yolo` | `bypassPermissions` — never prompts |
+| `--perm <mode>` | Claude/Codex permission mode (default `auto`); ignored by OpenCode |
+| `--yolo` | Claude/Codex `bypassPermissions`; ignored by OpenCode |
 | `--clean` | tear down sessions, worktrees and branches first |
-| `--no-view` | do not open terminal windows automatically |
+| `--ui` | use the browser dashboard and graphical broker |
+| `--port PORT` | dashboard port; requires `--ui`, default `0` selects a free port |
+| `--no-view` | print connection details without opening windows |
 
 If an agent or broker process exits unexpectedly, its tmux pane remains open
 with the exit status so you can inspect its output. Use `tmuxor stop <repo>`
 when you want to close the sessions deliberately.
+
+## Worktrees and code handoffs
+
+Each role works in `.claude-worktrees/tmuxor-<role>` on its own `tmuxor/<role>`
+branch. These are linked worktrees of one Git repository: they share commits
+and branch refs, but have separate working files and indexes.
+
+Agents stay in their own worktree for source inspection, edits, builds, and
+tests. A builder commits the change and sends its branch, full commit SHA, and
+checks run through the broker. The tester inspects and integrates that exact
+commit into its own branch, then tests locally. For example, from the tester's
+clean worktree:
+
+```sh
+git show <builder-commit-sha>
+git diff HEAD <builder-commit-sha>
+git merge --ff-only <builder-commit-sha>
+# Run the project's tests here.
+git rev-parse HEAD
+```
+
+No remote push, fetch, or pull is needed for these local handoffs. Agents use
+the supplied SHA so a builder's later commits do not silently change the review.
+The tester reports the received SHA and tested HEAD, and commits any new tests
+before handing them back. Missing commits, dirty worktrees, or diverged branches
+require coordination; agents must preserve existing work. A diverged branch may
+need an agreed merge or specific cherry-picks rather than a fast-forward.
+
+The generated instructions apply to Claude, Codex, and OpenCode and supersede
+older role prompts that tell agents to read teammates' worktrees. The roster
+lists teammates' branches, and Claude no longer receives `--add-dir` grants for
+teammate directories. This workflow is guided by prompts, not enforced filesystem
+isolation; native CLI permissions still apply.
+
+After updating tmuxor, stop and relaunch the team to regenerate prompts and start
+fresh agent sessions. Existing branches and worktrees are kept; `--clean` is not
+needed. Custom files under `agora/roles/` are preserved. Update any old handoff
+wording there or in skills to keep your project instructions consistent.
+
+## Browser dashboard
+
+```sh
+tmuxor /path/to/repo --ui
+# Choose a fixed port, without opening a browser automatically:
+tmuxor /path/to/repo --ui --port 8787 --no-view
+```
+
+The dashboard has an agent sidebar, live interactive terminals, a message box
+for giving an agent instructions, and a broker inbox. Focus on one agent or use
+Split to watch the team. Native CLI permission prompts remain interactive inside
+the embedded terminals. The message box adds the `[FROM OPERATOR]` header, so
+Codex replies participate in routing just like other broker-delivered messages.
+
+Select a pending reply to edit its text and recipient, then approve delivery or
+drop it. Human/done messages are acknowledged without being sent to another
+agent. Reviewed messages appear in Activity. If a delivery is interrupted, its
+message remains visible for inspection and cannot be automatically resent.
+
+Closing or refreshing the browser only detaches its terminal clients. Agent
+sessions and the dashboard continue running in tmux. The dashboard URL is
+printed at launch and saved in `.tmuxor/ui.json`. Use the full URL when opening
+a new browser tab: its token grants access to the local terminals and broker.
+The server listens on `127.0.0.1` only and bundles its assets without a CDN.
+
+For an existing team whose broker has exited, start the dashboard in the
+foreground with:
+
+```sh
+tmuxor ui /path/to/repo
+```
+
+Only one broker can own the queue. To switch from the terminal broker, press
+`q` in that broker first, then run the command above. Ctrl-C stops this foreground
+dashboard while keeping the agents running. `tmuxor stop <repo>` stops the tmux
+team, including the dashboard started with `--ui`.
+
+The browser launcher supports macOS (`open`) and Linux (`xdg-open`), and the
+terminal bridge uses portable PTYs. Browser integration tests currently run on
+Linux; macOS still needs a live verification run.
+
+Activity indicators are approximate: input marks an agent active and a completion
+message clears it. They cannot reliably identify every internal CLI state or
+permission prompt; inspect the live terminal when in doubt.
 
 ## Routing
 
@@ -98,8 +187,9 @@ In the broker: `s` send, `r` retarget, `e` edit in `$EDITOR`, `d` drop, `q` quit
 4. On approval it tags the message `[FROM SPECIFIER]`, pastes it into the
    recipient's pane, and submits.
 
-Both adapters hand `relay-stop` a finished assistant message directly, so
-nothing parses a transcript.
+Every adapter hands `relay-stop` the finished assistant text. OpenCode's plugin
+reads structured messages through its SDK when the session becomes idle;
+nothing scrapes terminal output or parses transcript files.
 
 ## Agent adapters
 
@@ -108,22 +198,72 @@ broker and delivery) from agent-specific setup. Everything an adapter varies
 sits behind `Adapter::generate_files`; the broker, queue, routing and prompt
 text never learn which CLI is on the other end.
 
-| | `claude` | `codex` |
-|---|---|---|
-| end-of-turn callback | `Stop` hook in a generated settings file | `notify` program in a generated profile |
-| payload arrives as | JSON on stdin | JSON as `argv[1]`, piped to stdin by a generated shim |
-| message field | `last_assistant_message` | `last-assistant-message` |
-| per-agent config | `--settings FILE` | `--profile tmuxor-<role>`, layered over your own config |
-| role prompt | `--append-system-prompt-file` | `developer_instructions` |
-| permissions | `--permission-mode` | `--ask-for-approval` + `--sandbox` |
+| | `claude` | `codex` | `opencode` |
+|---|---|---|---|
+| end-of-turn callback | `Stop` hook | `notify` program | `session.idle` plugin |
+| payload arrives as | JSON on stdin | JSON as `argv[1]`, piped to stdin by a shim | plugin pipes JSON to stdin |
+| message field | `last_assistant_message` | `last-assistant-message` | normalized to `last_assistant_message` |
+| per-agent config | `--settings FILE` | `--profile tmuxor-<role>` | `OPENCODE_CONFIG_DIR` |
+| role prompt | `--append-system-prompt-file` | `developer_instructions` | custom primary agent selected with `--agent` |
+| permissions | `--permission-mode` | `--ask-for-approval` + `--sandbox` | existing OpenCode settings |
 
 `--perm` keeps Claude's vocabulary and maps onto codex: `auto`/`default` ->
 `on-request` + `workspace-write`, `acceptEdits` -> `never` + `workspace-write`,
 `plan` -> `untrusted` + `read-only`, `--yolo` ->
 `--dangerously-bypass-approvals-and-sandbox`.
 
-A third adapter needs the same three things: how to start the agent, where the
+A new adapter needs the same three things: how to start the agent, where the
 role prompt goes, and how a finished message reaches `tmuxor relay-stop`.
+
+### OpenCode prompts and skills
+
+Use `opencode` in `agora/team.txt`, on its own or alongside other adapters:
+
+```text
+claude specifier
+opencode builder
+opencode tester
+```
+
+Each OpenCode role gets its own primary agent named `tmuxor-<role>`, with the
+shared rules, its role prompt, and routing instructions. It inherits OpenCode's
+normal project and global settings, including models, providers, and permissions.
+tmuxor does not map `--perm` or `--yolo` to OpenCode.
+
+Add optional skills beside the role prompt:
+
+```text
+agora/roles/
+├── builder.md
+├── builder/
+│   └── skills/
+│       └── implementation/
+│           ├── SKILL.md
+│           └── references/
+│               └── conventions.md
+└── tester.md
+```
+
+`SKILL.md` uses [OpenCode's native skill format](https://opencode.ai/docs/skills/),
+including `name` and `description` in YAML frontmatter. Only the builder's
+OpenCode process discovers `builder/skills/`; project and global skills remain
+available to every role. `--roles DIR` also moves this lookup to
+`DIR/<role>/skills/`. These extra role skill folders currently apply to OpenCode.
+
+tmuxor reserves `OPENCODE_CONFIG_DIR` for a generated directory under `.tmuxor/`.
+It contains the agent config, the completion plugin, and a symlink to that role's
+skills, so supporting files stay accessible. Project and global config files are
+not edited. Restart the team after adding a new role skill directory.
+
+The plugin relays only the latest completed assistant reply from a parent
+session. It skips subagents, compaction summaries, failed or unfinished turns,
+reasoning, and tool output, and suppresses duplicate idle notifications. Replies
+to messages typed directly in an OpenCode pane also reach the broker. Relay
+errors are recorded in `.tmuxor/relay.log`.
+
+OpenCode runs the plugin itself; no separate Node installation or npm install is
+needed for tmuxor's plugin. This integration targets the OpenCode 1.x plugin API
+and has been checked with OpenCode 1.18.29.
 
 ## Things that were not obvious
 
@@ -146,9 +286,10 @@ prompts, so an agent stalls mid-turn on a permission dialog and you are back to
 babysitting every session. Default is `auto`, whose classifier approves routine
 work and stops the risky calls.
 
-**A worktree bounds writes, not blast radius.** It keeps agents off each other's
-files and gives you a git-level undo. It does not sandbox what a shell command
-can reach. `--yolo` removes the last check.
+**A worktree is not a filesystem sandbox.** It gives each role separate working
+files and Git history for committed changes, but does not restrict what a shell
+command can reach. Staying in the assigned worktree is a prompt instruction;
+the agent CLI's permissions control actual access.
 
 **Subagent turns fire `Stop` too.** The Claude adapter ignores any payload
 carrying an `agent_id`; a subagent's report is internal, not a message to a
@@ -178,9 +319,9 @@ meant to reject. The cost is that a message you type directly into a codex pane
 is not auto-relayed — talk to a codex agent by hand and its reply stays in the
 pane.
 
-**Codex does not need `--add-dir` to read teammates.** There it grants *write*
-access, which would break the one-writer-per-worktree rule; its sandbox already
-allows reads outside the workspace.
+**Teammate code travels through Git.** Agents can inspect shared local commits
+and integrate them into their own branch without access to teammates' working
+files. Launchers do not add teammate directories with `--add-dir`.
 
 **Identity travels as env, not config.** All worktrees share the repo, so a
 committed agent settings file would apply to every agent. Each role gets a
@@ -203,12 +344,48 @@ a generated launcher script so the pane command is a bare path.
 
 ```
 src/main.rs            launcher, broker and completion-hook subcommands
-Cargo.toml             dependency-free Rust package
+src/ui.rs              local HTTP API, graphical broker and PTY/WebSocket bridge
+src/opencode-plugin.mjs OpenCode completion plugin, embedded in the Rust binary
+web/                   dashboard source and bundled xterm.js assets
+Cargo.toml             Rust package and web/terminal dependencies
 examples/team.txt     bundled example manifest
 examples/roles/*.md   bundled example role prompts
+tests/opencode-plugin.test.mjs  plugin/relay integration tests
+web/tests/             browser tests with real tmux and offline fixture agents
 ```
 
 Runtime state lives in `<repo>/.tmuxor/` (queue, generated prompts, settings,
 launchers and notify shims, `panes.tsv`, `relay.log`). Worktrees go in
 `<repo>/.claude-worktrees/`. The codex adapter also writes
 `$CODEX_HOME/tmuxor-<role>.config.toml` (default `~/.codex`).
+OpenCode's per-role config and plugin live in `.tmuxor/opencode-<role>/` and are
+removed by `--clean` along with the other runtime files.
+The dashboard also stores its roster in `.tmuxor/agents.json`, reviewed messages
+in `.tmuxor/reviewed/`, and interrupted deliveries in `.tmuxor/inflight/`.
+
+## Development checks
+
+```sh
+cargo test
+cargo build
+node tests/opencode-plugin.test.mjs
+cargo clippy --all-targets -- -D warnings
+```
+
+The plugin tests use Node's built-in test runner and the built `tmuxor` binary to
+check queue delivery without an AI provider or running tmux sessions.
+
+To run the browser suite (Node, Python 3, Git, and tmux required):
+
+```sh
+cargo build
+cd web
+npm ci
+npx playwright install chromium
+npm test
+```
+
+The suite uses an isolated tmux socket and offline fixture agents. Set
+`TMUXOR_CHROMIUM=/path/to/chrome` to use an existing Chromium installation.
+After changing xterm.js versions, run `npm run vendor` and commit the updated
+`web/vendor/` files. Other HTML, CSS, and JS edits are embedded by `cargo build`.

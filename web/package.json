@@ -1,0 +1,16 @@
+{
+  "name": "tmuxor-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor": "node vendor.mjs",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "@xterm/xterm": "6.0.0",
+    "@xterm/addon-fit": "0.11.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

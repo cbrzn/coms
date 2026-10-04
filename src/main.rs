@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod ui;
+
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const DEFAULT_TEAM: &str = include_str!("../examples/team.txt");
@@ -18,6 +20,7 @@ struct Agent {
     adapter: Adapter,
     role: String,
     prompt: String,
+    skills: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,15 +33,25 @@ struct Rule {
 enum Adapter {
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl Adapter {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "opencode" => Ok(Self::OpenCode),
             _ => Err(format!(
-                "agent adapter '{value}' is not implemented yet; available adapters: claude, codex"
+                "agent adapter '{value}' is not implemented yet; available adapters: claude, codex, opencode"
             )
             .into()),
         }
@@ -55,6 +68,7 @@ impl Adapter {
         match self {
             Self::Claude => generate_claude_files(runtime, agent, agents, rules, permission_mode),
             Self::Codex => generate_codex_files(runtime, agent, agents, rules, permission_mode),
+            Self::OpenCode => generate_opencode_files(runtime, agent, agents, rules),
         }
     }
 }
@@ -69,6 +83,8 @@ struct LaunchOptions {
     permission_mode: String,
     clean: bool,
     open_views: bool,
+    ui: bool,
+    port: u16,
 }
 
 #[derive(Debug)]
@@ -79,7 +95,7 @@ struct Runtime {
     executable: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct QueueMessage {
     from: String,
     to: String,
@@ -96,6 +112,10 @@ fn main() {
 fn run() -> Result<()> {
     let mut arguments = env::args().skip(1).collect::<Vec<_>>();
     match arguments.first().map(String::as_str) {
+        Some("ui") => {
+            arguments.remove(0);
+            ui::run(&arguments)
+        }
         Some("broker") => {
             arguments.remove(0);
             if !arguments.is_empty() {
@@ -135,10 +155,11 @@ fn run() -> Result<()> {
 
 fn print_usage() {
     println!(
-        "Usage: tmuxor <repo> [--team FILE] [--roles DIR] [--rules DIR] [--task TEXT] [--perm MODE] [--yolo] [--clean] [--no-view]"
+        "Usage: tmuxor <repo> [--team FILE] [--roles DIR] [--rules DIR] [--task TEXT] [--perm MODE] [--yolo] [--clean] [--ui] [--port PORT] [--no-view]"
     );
     println!("       tmuxor init [repo] [--force]");
     println!("       tmuxor broker");
+    println!("       tmuxor ui <repo> [--port PORT] [--no-view]");
     println!("       tmuxor relay-stop");
     println!("       tmuxor stop <repo>");
 }
@@ -152,6 +173,8 @@ fn parse_launch_options(arguments: Vec<String>) -> Result<LaunchOptions> {
     let mut permission_mode = "auto".to_owned();
     let mut clean = false;
     let mut open_views = true;
+    let mut ui = false;
+    let mut port = 0;
     let mut index = 0;
 
     while index < arguments.len() {
@@ -185,6 +208,13 @@ fn parse_launch_options(arguments: Vec<String>) -> Result<LaunchOptions> {
             "--yolo" => permission_mode = "bypassPermissions".to_owned(),
             "--clean" => clean = true,
             "--no-view" => open_views = false,
+            "--ui" => ui = true,
+            "--port" => {
+                index += 1;
+                port = required_argument(&arguments, index, "--port")?
+                    .parse()
+                    .map_err(|_| "--port must be between 0 and 65535")?;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -201,6 +231,9 @@ fn parse_launch_options(arguments: Vec<String>) -> Result<LaunchOptions> {
         index += 1;
     }
 
+    if port != 0 && !ui {
+        return Err("--port requires --ui".into());
+    }
     Ok(LaunchOptions {
         repo: repo.ok_or("a repository is required")?,
         team,
@@ -210,6 +243,8 @@ fn parse_launch_options(arguments: Vec<String>) -> Result<LaunchOptions> {
         permission_mode,
         clean,
         open_views,
+        ui,
+        port,
     })
 }
 
@@ -249,8 +284,15 @@ fn launch(options: LaunchOptions) -> Result<()> {
     create_worktrees(&runtime, &agents)?;
     generate_agent_files(&runtime, &agents, &rules, &options.permission_mode)?;
     create_sessions(&runtime, &agents)?;
-    start_broker(&runtime)?;
-    if options.open_views {
+    ui::write_roster(&runtime, &agents)?;
+    start_broker(&runtime, options.ui, options.port)?;
+    if options.ui {
+        let url = ui::wait_for_url(&runtime.home)?;
+        println!("dashboard: {url}");
+        if options.open_views {
+            ui::open_browser(&url);
+        }
+    } else if options.open_views {
         open_terminal_views(&agents);
     }
 
@@ -322,6 +364,12 @@ fn load_agents(
             adapter: Adapter::parse(fields[0])?,
             role: fields[1].to_ascii_lowercase(),
             prompt,
+            skills: role_directory
+                .as_ref()
+                .map(|directory| directory.join(fields[1]).join("skills"))
+                .filter(|path| path.is_dir())
+                .map(fs::canonicalize)
+                .transpose()?,
         };
         if fields[2..].contains(&"--entry") {
             entry = Some(agent.role.clone());
@@ -508,18 +556,6 @@ fn generate_claude_files(
         "  --append-system-prompt-file {}",
         shell_quote(&prompt_path.display().to_string())
     ));
-    for teammate in agents.iter().filter(|teammate| teammate.role != agent.role) {
-        launcher.push_str(&format!(
-            " \\\n  --add-dir {}",
-            shell_quote(
-                &runtime
-                    .worktrees
-                    .join(format!("tmuxor-{}", teammate.role))
-                    .display()
-                    .to_string()
-            )
-        ));
-    }
     launcher.push('\n');
     fs::write(&launcher_path, launcher)?;
     make_executable(&launcher_path)
@@ -579,6 +615,61 @@ fn generate_codex_files(
     }
     launcher.push('\n');
     fs::write(&launcher_path, launcher)?;
+    make_executable(&launcher_path)
+}
+
+fn generate_opencode_files(
+    runtime: &Runtime,
+    agent: &Agent,
+    agents: &[Agent],
+    rules: &[Rule],
+) -> Result<()> {
+    let directory = runtime.home.join(format!("opencode-{}", agent.role));
+    fs::create_dir_all(directory.join("plugins"))?;
+    fs::write(
+        directory.join("plugins/tmuxor.js"),
+        include_str!("opencode-plugin.mjs"),
+    )?;
+
+    let prompt_path = runtime.home.join(format!("prompt-{}.txt", agent.role));
+    fs::write(
+        &prompt_path,
+        generated_prompt(agent, agents, rules, runtime),
+    )?;
+    let name = format!("tmuxor-{}", agent.role);
+    fs::write(
+        directory.join("opencode.json"),
+        format!(
+            "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{{}:{{\"description\":{},\"mode\":\"primary\",\"prompt\":{}}}}}}}\n",
+            json_string(&name),
+            json_string(&format!("tmuxor {}", agent.role)),
+            json_string(&format!("{{file:{}}}", prompt_path.display())),
+        ),
+    )?;
+
+    // A native skill directory preserves OpenCode's other skill paths and keeps
+    // supporting files beside SKILL.md. Refresh it when --roles changes.
+    let skills_link = directory.join("skills");
+    if fs::symlink_metadata(&skills_link).is_ok() {
+        fs::remove_file(&skills_link)?;
+    }
+    if let Some(skills) = &agent.skills {
+        std::os::unix::fs::symlink(skills, &skills_link)?;
+    }
+
+    let launcher_path = runtime.home.join(format!("launch-{}.sh", agent.role));
+    fs::write(
+        &launcher_path,
+        format!(
+            "#!/usr/bin/env sh\nexport OPENCODE_CONFIG_DIR={}\nexport TMUXOR_HOME={}\nexport TMUXOR_ROLE={}\nexport TMUXOR_EXECUTABLE={}\nexec opencode {} --agent {}\n",
+            shell_quote(&directory.display().to_string()),
+            shell_quote(&runtime.home.display().to_string()),
+            shell_quote(&agent.role),
+            shell_quote(&runtime.executable.display().to_string()),
+            shell_quote(&runtime.worktrees.join(&name).display().to_string()),
+            shell_quote(&name),
+        ),
+    )?;
     make_executable(&launcher_path)
 }
 
@@ -642,7 +733,11 @@ fn generated_prompt(agent: &Agent, agents: &[Agent], rules: &[Rule], runtime: &R
         "You are {}, one agent in a team working on the same repository.\n",
         agent.role.to_ascii_uppercase()
     ));
-    prompt.push_str("You each have your own git worktree. Your teammates:\n\n");
+    prompt.push_str(&format!(
+        "Your worktree: {}\nYour branch: tmuxor/{}\n\nYou each have your own git worktree and branch, sharing the same local Git\nrepository and commit objects. Your teammates:\n\n",
+        runtime.worktrees.join(format!("tmuxor-{}", agent.role)).display(),
+        agent.role,
+    ));
     for teammate in agents.iter().filter(|teammate| teammate.role != agent.role) {
         prompt.push_str(&format!(
             "  {:<12} {}\n",
@@ -650,16 +745,55 @@ fn generated_prompt(agent: &Agent, agents: &[Agent], rules: &[Rule], runtime: &R
             role_summary(&teammate.prompt)
         ));
         prompt.push_str(&format!(
-            "  {:<12}   worktree: {}\n",
-            "",
-            runtime
-                .worktrees
-                .join(format!("tmuxor-{}", teammate.role))
-                .display()
+            "  {:<12}   branch: tmuxor/{}\n",
+            "", teammate.role,
         ));
     }
     prompt.push_str(
-        "\n## Addressing a teammate\n\nPut a routing line on a line of its own, ideally the first line:\n\n    [TO: <teammate>]\n\nInclude exactly one. Only your final message of a turn is relayed; if it carries\nno routing line, or more than one, it stops at the operator who must pick a\nrecipient by hand.\n\nUse [TO: human] when you need the operator rather than a teammate, and\n[TO: done] when the work is finished and the chain should stop.\n\n## What the others can see\n\nNothing except the message you send. Your tool calls, your thinking and your\nterminal output are invisible to them. Make each message self-contained: what\nyou did, what you want from the recipient, and any specific question. Reference\nconcrete file paths. Keep it short — this is a conversation, not a report.\n\nA human reviews every message before it is relayed, and may edit, retarget or\ndrop it. You may only write inside your own worktree, but you can read the\nothers' to see what they did.\n",
+        r#"
+## Worktree and Git handoffs
+
+Follow this protocol if a role prompt or skill tells you to read a teammate's
+worktree. Stay in your own worktree for all source inspection, edits, Git
+commands, builds, and tests. Do not enter, read, copy files from, or run commands
+in another role's worktree or the original checkout. Inspect committed changes
+through Git from your own worktree instead. Shared configuration and skill files
+provided by tmuxor may still be read from their configured locations.
+
+Before changing or integrating code, check `git rev-parse --show-toplevel`,
+`git branch --show-current`, and `git status --short`. Confirm that you are in
+your assigned worktree on your own branch. Never check out a teammate's branch
+or modify its ref, and never discard existing changes to prepare a handoff.
+
+When handing off code:
+- Commit your task changes on your own branch before asking a teammate to use
+  them. Stage only relevant files. Uncommitted changes are not part of a handoff.
+- Include your branch, the full commit SHA from `git rev-parse HEAD`, a summary,
+  and the checks run. Use repository-relative file paths.
+
+When receiving code:
+- Require a commit SHA; if it is missing, ask the sender to commit and resend.
+  Do not inspect their working directory as a fallback.
+- Inspect the supplied commit with `git show <commit-sha>` and compare it with
+  your current code using `git diff HEAD <commit-sha>` in your own worktree.
+  Local role branches and commits are already visible: no remote fetch, push,
+  or pull is needed for a team handoff.
+- With a clean worktree, integrate the exact supplied commit into your own
+  branch using `git merge --ff-only <commit-sha>`, then build and test here.
+  Use the SHA, not a moving branch tip. If already incorporated, verify with
+  `git merge-base --is-ancestor <commit-sha> HEAD` before testing.
+- If you have local changes, preserve them first. If branches have diverged,
+  coordinate a merge or specific cherry-picks with the sender/operator. Do not
+  reset, force-update, switch branches, or test in the sender's worktree to
+  bypass the problem. Ask the operator if project rules block Git integration.
+- Report the received SHA and your tested HEAD, test commands, and results.
+  Commit any new tests or fixes before handing them back the same way.
+
+Specification-only or status messages need no commit when no files changed.
+"#,
+    );
+    prompt.push_str(
+        "\n## Addressing a teammate\n\nPut a routing line on a line of its own, ideally the first line:\n\n    [TO: <teammate>]\n\nInclude exactly one. Only your final message of a turn is relayed; if it carries\nno routing line, or more than one, it stops at the operator who must pick a\nrecipient by hand.\n\nUse [TO: human] when you need the operator rather than a teammate, and\n[TO: done] when the work is finished and the chain should stop.\n\n## What the others can see\n\nYour teammates receive your message and can inspect committed code through Git.\nYour tool calls, your thinking and your terminal output are invisible to them.\nMake each message self-contained: what you did, what you want from the\nrecipient, and any specific question. Reference repository-relative file paths\nand commit SHAs for code handoffs. Keep it short — this is a conversation, not\na report.\n\nA human reviews every message before it is relayed, and may edit, retarget or\ndrop it.\n",
     );
     prompt
 }
@@ -713,8 +847,12 @@ fn create_sessions(runtime: &Runtime, agents: &[Agent]) -> Result<()> {
     Ok(())
 }
 
-fn start_broker(runtime: &Runtime) -> Result<()> {
-    tmux([
+fn start_broker(runtime: &Runtime, dashboard: bool, port: u16) -> Result<()> {
+    let repo = runtime.repo.display().to_string();
+    let executable = runtime.executable.display().to_string();
+    let home = format!("TMUXOR_HOME={}", runtime.home.display());
+    let port = port.to_string();
+    let mut arguments = vec![
         "new-session",
         "-d",
         "-s",
@@ -724,12 +862,18 @@ fn start_broker(runtime: &Runtime) -> Result<()> {
         "-y",
         "50",
         "-c",
-        &runtime.repo.display().to_string(),
+        &repo,
         "-e",
-        &format!("TMUXOR_HOME={}", runtime.home.display()),
-        &runtime.executable.display().to_string(),
-        "broker",
-    ])?;
+        &home,
+        &executable,
+    ];
+    if dashboard {
+        let _ = fs::remove_file(runtime.home.join("ui.json"));
+        arguments.extend(["ui", &repo, "--no-view", "--port", &port]);
+    } else {
+        arguments.push("broker");
+    }
+    tmux(arguments)?;
     tmux([
         "set-window-option",
         "-t",
@@ -902,6 +1046,7 @@ fn run_broker() -> Result<()> {
     let home = PathBuf::from(
         env::var("TMUXOR_HOME").map_err(|_| "tmuxor broker must be launched by tmuxor")?,
     );
+    let _broker_lock = ui::broker_lock(&home)?;
     let panes = read_panes(&home)?;
     let roles = panes.keys().cloned().collect::<Vec<_>>();
     let mut busy = HashSet::new();
@@ -1473,7 +1618,7 @@ fn skip_whitespace(bytes: &[u8], mut index: usize) -> usize {
 }
 
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn make_executable(path: &Path) -> Result<()> {
@@ -1642,11 +1787,13 @@ mod tests {
                 adapter: Adapter::Claude,
                 role: "builder".to_owned(),
                 prompt: "Build things.".to_owned(),
+                skills: None,
             },
             Agent {
                 adapter: Adapter::Claude,
                 role: "tester".to_owned(),
                 prompt: "Test things.".to_owned(),
+                skills: None,
             },
         ];
         let rules = vec![
@@ -1663,7 +1810,7 @@ mod tests {
         let launcher = fs::read_to_string(runtime.home.join("launch-builder.sh")).unwrap();
         assert!(!launcher.contains("\n+"));
         assert!(launcher.contains("exec claude \\\n  --settings"));
-        assert!(launcher.contains("\n  --add-dir "));
+        assert!(!launcher.contains("--add-dir"));
         let prompt = fs::read_to_string(runtime.home.join("prompt-builder.txt")).unwrap();
         assert!(prompt.contains("# Project rules"));
         assert!(prompt.contains("Keep changes focused."));
@@ -1690,6 +1837,100 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["00-project.md", "20-testing.md"]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_opencode_roles_and_their_own_skills_with_overrides() {
+        let root = temporary_path("tmuxor-test");
+        let roles = root.join("custom-roles");
+        let builder_skills = roles.join("builder/skills");
+        fs::create_dir_all(&builder_skills).unwrap();
+        fs::write(roles.join("builder.md"), "Build things.").unwrap();
+        fs::write(roles.join("tester.md"), "Test things.").unwrap();
+        let team = root.join("custom-team.txt");
+        fs::write(&team, "OpenCode builder --entry\nclaude tester\n").unwrap();
+
+        let (agents, entry) = load_agents(&root, Some(&team), Some(&roles)).unwrap();
+        assert_eq!(entry, "builder");
+        assert!(matches!(agents[0].adapter, Adapter::OpenCode));
+        assert_eq!(agents[0].prompt, "Build things.");
+        assert_eq!(
+            agents[0].skills,
+            Some(fs::canonicalize(builder_skills).unwrap())
+        );
+        assert!(agents[1].skills.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_launcher_preserves_paths_and_uses_native_permissions() {
+        let root = temporary_path("tmuxor's test");
+        let runtime = Runtime {
+            repo: root.join("repo"),
+            home: root.join("home"),
+            worktrees: root.join("worktrees"),
+            executable: root.join("bin/tmuxor"),
+        };
+        let skills = root.join("roles/builder/skills");
+        fs::create_dir_all(skills.join("review")).unwrap();
+        fs::write(skills.join("review/SKILL.md"), "Review the code.").unwrap();
+        let mut agent = Agent {
+            adapter: Adapter::OpenCode,
+            role: "builder".to_owned(),
+            prompt: "Build things.".to_owned(),
+            skills: Some(skills.clone()),
+        };
+        let rules = vec![Rule {
+            name: "00-project.md".to_owned(),
+            contents: "Keep changes focused.".to_owned(),
+        }];
+        generate_agent_files(&runtime, &[agent.clone()], &rules, "bypassPermissions").unwrap();
+
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("opencode");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' \"$OPENCODE_CONFIG_DIR\" \"$TMUXOR_HOME\" \"$TMUXOR_ROLE\" \"$TMUXOR_EXECUTABLE\" \"$@\"\n",
+        ).unwrap();
+        make_executable(&stub).unwrap();
+        let output = Command::new(runtime.home.join("launch-builder.sh"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let directory = runtime.home.join("opencode-builder");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{}\n{}\nbuilder\n{}\n{}\n--agent\ntmuxor-builder\n",
+                directory.display(),
+                runtime.home.display(),
+                runtime.executable.display(),
+                runtime.worktrees.join("tmuxor-builder").display()
+            ),
+        );
+        let settings = fs::read_to_string(directory.join("opencode.json")).unwrap();
+        assert!(!settings.contains("permission"));
+        assert!(settings.contains("\"mode\":\"primary\""));
+        let prompt = fs::read_to_string(runtime.home.join("prompt-builder.txt")).unwrap();
+        assert!(prompt.contains("Build things."));
+        assert!(prompt.contains("Keep changes focused."));
+        assert!(prompt.contains("[TO: <teammate>]"));
+        assert_eq!(fs::read_link(directory.join("skills")).unwrap(), skills);
+        assert!(directory.join("skills/review/SKILL.md").is_file());
+        assert!(directory.join("plugins/tmuxor.js").is_file());
+
+        // Stopping and starting with a different role directory must not leave
+        // the previous role's skills in OpenCode's discovery path.
+        agent.skills = None;
+        generate_agent_files(&runtime, &[agent], &rules, "auto").unwrap();
+        assert!(fs::symlink_metadata(directory.join("skills")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
